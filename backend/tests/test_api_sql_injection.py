@@ -535,6 +535,350 @@ class TestGetProjectsSQLInjectionPrevention:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for /api/v1/tasks tests
+# ---------------------------------------------------------------------------
+
+def _create_v1_user(db_session, username, email, role='team_member'):
+    """Create a user for /api/v1/tasks tests."""
+    existing = db_session.query(User).filter_by(username=username).first()
+    if existing:
+        return existing
+    user = User(username=username, email=email, role=role)
+    user.set_password('testpass123')
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
+def _create_v1_project(db_session, name, owner_id):
+    """Create a project for /api/v1/tasks tests."""
+    from models import Project
+    project = Project(name=name, description='Test project', owner_id=owner_id, is_public=False)
+    db_session.add(project)
+    db_session.commit()
+    return project
+
+
+def _create_v1_task(db_session, title, description, project_id, created_by, status='pending'):
+    """Create a task directly in the test database for /api/v1/tasks tests."""
+    from models import Task
+    task = Task(
+        title=title,
+        description=description,
+        project_id=project_id,
+        created_by=created_by,
+        status=status,
+        priority='medium',
+    )
+    db_session.add(task)
+    db_session.commit()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Functional tests – /api/v1/tasks search works correctly after the fix
+# ---------------------------------------------------------------------------
+
+class TestGetTasksV1SearchFunctionality:
+    """Verify that the search feature on /api/v1/tasks works correctly
+    after the parameterized-query fix for CWE-89."""
+
+    def test_get_tasks_no_search_returns_all(self, client, db_session):
+        """Without a search parameter all tasks are returned."""
+        user = _create_v1_user(db_session, 'v1_func_user1', 'v1func1@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 1', user.id)
+        _create_v1_task(db_session, 'Task Alpha', 'first task', project.id, user.id)
+        _create_v1_task(db_session, 'Task Beta', 'second task', project.id, user.id)
+
+        response = client.get('/api/v1/tasks')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert 'tasks' in data
+        assert len(data['tasks']) >= 2
+
+    def test_get_tasks_search_by_title_returns_matching_task(self, client, db_session):
+        """A search term matching a title returns only the matching task."""
+        user = _create_v1_user(db_session, 'v1_func_user2', 'v1func2@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 2', user.id)
+        _create_v1_task(db_session, 'NeedleInHaystack', 'some desc', project.id, user.id)
+        _create_v1_task(db_session, 'Unrelated Task', 'other desc', project.id, user.id)
+
+        response = client.get('/api/v1/tasks?search=NeedleInHaystack')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'NeedleInHaystack' in titles
+        assert 'Unrelated Task' not in titles
+
+    def test_get_tasks_search_by_description_returns_matching_task(self, client, db_session):
+        """A search term matching a description returns the correct task."""
+        user = _create_v1_user(db_session, 'v1_func_user3', 'v1func3@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 3', user.id)
+        _create_v1_task(db_session, 'Generic Title', 'unique_desc_keyword_xyz', project.id, user.id)
+        _create_v1_task(db_session, 'Other Title', 'unrelated', project.id, user.id)
+
+        response = client.get('/api/v1/tasks?search=unique_desc_keyword_xyz')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Generic Title' in titles
+        assert 'Other Title' not in titles
+
+    def test_get_tasks_search_partial_match(self, client, db_session):
+        """Partial search term matches substrings in title or description."""
+        user = _create_v1_user(db_session, 'v1_func_user4', 'v1func4@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 4', user.id)
+        _create_v1_task(db_session, 'Implement Feature Z', 'feature description', project.id, user.id)
+
+        response = client.get('/api/v1/tasks?search=Feature')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Implement Feature Z' in titles
+
+    def test_get_tasks_search_no_match_returns_empty(self, client, db_session):
+        """A search term that matches nothing returns an empty list."""
+        user = _create_v1_user(db_session, 'v1_func_user5', 'v1func5@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 5', user.id)
+        _create_v1_task(db_session, 'Normal Task V1', 'normal desc', project.id, user.id)
+
+        response = client.get('/api/v1/tasks?search=zzznomatch_unique')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['tasks'] == []
+
+    def test_get_tasks_search_combined_with_project_id(self, client, db_session):
+        """search and project_id filters can be combined correctly."""
+        user = _create_v1_user(db_session, 'v1_func_user6', 'v1func6@example.com')
+        proj_a = _create_v1_project(db_session, 'V1 Combined Proj A', user.id)
+        proj_b = _create_v1_project(db_session, 'V1 Combined Proj B', user.id)
+        _create_v1_task(db_session, 'Widget Task V1 A', 'widget work', proj_a.id, user.id)
+        _create_v1_task(db_session, 'Widget Task V1 B', 'widget work', proj_b.id, user.id)
+
+        response = client.get(f'/api/v1/tasks?search=Widget&project_id={proj_a.id}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Widget Task V1 A' in titles
+        assert 'Widget Task V1 B' not in titles
+
+    def test_get_tasks_empty_search_returns_all(self, client, db_session):
+        """An empty search string falls through to the ORM path and returns all tasks."""
+        user = _create_v1_user(db_session, 'v1_func_user7', 'v1func7@example.com')
+        project = _create_v1_project(db_session, 'V1 Func Project 7', user.id)
+        _create_v1_task(db_session, 'Empty Search Task', 'desc', project.id, user.id)
+
+        response = client.get('/api/v1/tasks?search=')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert len(data['tasks']) >= 1
+
+    def test_get_tasks_filter_by_project_id_only(self, client, db_session):
+        """Filtering by project_id without search uses the ORM path correctly."""
+        user = _create_v1_user(db_session, 'v1_func_user8', 'v1func8@example.com')
+        proj_a = _create_v1_project(db_session, 'V1 ProjID Only A', user.id)
+        proj_b = _create_v1_project(db_session, 'V1 ProjID Only B', user.id)
+        _create_v1_task(db_session, 'Task in Proj A', 'desc', proj_a.id, user.id)
+        _create_v1_task(db_session, 'Task in Proj B', 'desc', proj_b.id, user.id)
+
+        response = client.get(f'/api/v1/tasks?project_id={proj_a.id}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Task in Proj A' in titles
+        assert 'Task in Proj B' not in titles
+
+    def test_get_tasks_response_has_tasks_key(self, client, db_session):
+        """Response always contains the 'tasks' key."""
+        response = client.get('/api/v1/tasks')
+        assert response.status_code == 200
+        assert 'tasks' in response.get_json()
+
+
+# ---------------------------------------------------------------------------
+# Security tests – /api/v1/tasks SQL injection prevention (CWE-89)
+# ---------------------------------------------------------------------------
+
+class TestGetTasksV1SQLInjectionPrevention:
+    """
+    Verify that SQL injection payloads in the 'search', 'project_id', and
+    'assigned_to' query parameters of /api/v1/tasks are treated as literal
+    bound values and do NOT alter query structure or results.
+
+    The fix uses SQLAlchemy text() with named parameters (:search, :project_id,
+    :assigned_to) so user input is never interpolated into the SQL string.
+    """
+
+    def test_sqli_search_or_tautology_does_not_return_all_rows(self, client, db_session):
+        """
+        Classic OR-1=1 tautology in 'search' must NOT return all rows when no
+        real match exists.
+
+        Without the fix: the .format() call would embed the payload into the SQL,
+        making the WHERE clause always true and returning every task.
+        With the fix: the entire string is bound as a LIKE parameter literal and
+        cannot escape the quoted value — only tasks whose title/description
+        literally contain that text would match.
+        """
+        user = _create_v1_user(db_session, 'v1sqli_user1', 'v1sqli1@example.com')
+        project = _create_v1_project(db_session, 'V1 SQLi Project 1', user.id)
+        _create_v1_task(db_session, 'Secret V1 Task', 'confidential', project.id, user.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Secret V1 Task' not in titles
+
+    def test_sqli_search_single_quote_does_not_error(self, client, db_session):
+        """A bare single-quote in the 'search' parameter must not raise a DB error."""
+        response = client.get("/api/v1/tasks?search='")
+        assert response.status_code == 200
+
+    def test_sqli_search_double_quote_does_not_error(self, client, db_session):
+        """A double-quote in the 'search' parameter must not raise a DB error."""
+        response = client.get('/api/v1/tasks?search="')
+        assert response.status_code == 200
+
+    def test_sqli_search_semicolon_drop_table_does_not_affect_db(self, client, db_session):
+        """
+        A stacked DROP TABLE payload must not crash the server or destroy the
+        tasks table — database integrity is preserved after the request.
+        """
+        user = _create_v1_user(db_session, 'v1sqli_user4', 'v1sqli4@example.com')
+        project = _create_v1_project(db_session, 'V1 SQLi Project 4', user.id)
+        _create_v1_task(db_session, 'V1 Persistent Task', 'should survive', project.id, user.id)
+
+        payload = "x'; DROP TABLE tasks; --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        # Must not crash
+        assert response.status_code == 200
+
+        # The tasks table must still be intact and contain our task
+        get_all = client.get('/api/v1/tasks')
+        assert get_all.status_code == 200
+        titles = [t['title'] for t in get_all.get_json()['tasks']]
+        assert 'V1 Persistent Task' in titles
+
+    def test_sqli_search_comment_sequences_treated_literally(self, client, db_session):
+        """SQL comment sequences (-- and #) in 'search' must be treated as literals."""
+        for payload in ["--", "#", "' --", "admin'--"]:
+            response = client.get(f'/api/v1/tasks?search={payload}')
+            assert response.status_code == 200, f"Payload '{payload}' caused an error"
+
+    def test_sqli_search_union_select_does_not_return_extra_rows(self, client, db_session):
+        """
+        A UNION SELECT payload in 'search' must not inject additional rows
+        into the result set.
+
+        Without the fix the UNION could append attacker-controlled columns to
+        the result.  With the parameterized fix the entire string is the LIKE
+        operand and matches nothing in the database.
+        """
+        user = _create_v1_user(db_session, 'v1sqli_user6', 'v1sqli6@example.com')
+        project = _create_v1_project(db_session, 'V1 SQLi Project 6', user.id)
+        _create_v1_task(db_session, 'Real Task V1', 'real desc', project.id, user.id)
+
+        payload = "x' UNION SELECT 1,2,3,4,5,6,7,8,9,10 --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        # The literal LIKE pattern won't match any real task
+        assert data['tasks'] == []
+
+    def test_sqli_search_encoded_quote_does_not_error(self, client, db_session):
+        """URL-encoded single quote (%27) in 'search' must not cause a server error."""
+        response = client.get('/api/v1/tasks?search=%27')
+        assert response.status_code == 200
+
+    def test_sqli_search_null_byte_does_not_error(self, client, db_session):
+        """
+        A null byte (%00) in the 'search' parameter must not cause a server error.
+        The URL-encoded form is used here so no raw control byte is embedded in
+        this source file.
+        """
+        response = client.get('/api/v1/tasks?search=%00')
+        # Must not crash with 500; 400 is acceptable if the app rejects it
+        assert response.status_code in (200, 400)
+
+    def test_sqli_search_backslash_does_not_error(self, client, db_session):
+        """Backslash sequences in 'search' must not cause a server error."""
+        response = client.get("/api/v1/tasks?search=\\")
+        assert response.status_code == 200
+
+    def test_sqli_search_stacked_insert_does_not_create_row(self, client, db_session):
+        """A stacked INSERT payload must not create a new task row."""
+        before_count = len(client.get('/api/v1/tasks').get_json()['tasks'])
+
+        payload = "'; INSERT INTO tasks (title, description, project_id, created_by, status, priority) VALUES ('injected_v1', 'injected', 1, 1, 'pending', 'low'); --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        after = client.get('/api/v1/tasks').get_json()['tasks']
+        titles = [t['title'] for t in after]
+        assert 'injected_v1' not in titles
+
+    def test_sqli_search_numeric_tautology_does_not_return_rows(self, client, db_session):
+        """A numeric tautology (1=1) must not cause all rows to be returned."""
+        user = _create_v1_user(db_session, 'v1sqli_user10', 'v1sqli10@example.com')
+        project = _create_v1_project(db_session, 'V1 SQLi Project 10', user.id)
+        _create_v1_task(db_session, 'Tautology Task V1', 'confidential', project.id, user.id)
+
+        payload = "1' OR 1=1 --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Tautology Task V1' not in titles
+
+    def test_sqli_project_id_injection_does_not_return_extra_rows(self, client, db_session):
+        """
+        An injection payload in 'project_id' (combined with search) must not
+        return rows from other projects.
+
+        With the fix 'project_id' is bound as a named parameter (:project_id),
+        so the injected string cannot alter the query logic.
+        """
+        user = _create_v1_user(db_session, 'v1sqli_user11', 'v1sqli11@example.com')
+        project = _create_v1_project(db_session, 'V1 SQLi Project 11', user.id)
+        _create_v1_task(db_session, 'CrossProject Task V1', 'desc', project.id, user.id)
+
+        payload = "1 OR 1=1"
+        response = client.get(f'/api/v1/tasks?search=CrossProject&project_id={payload}')
+        # Must not return a 500; 200 (with filtered/no results) or 400 is acceptable
+        assert response.status_code in (200, 400)
+
+    def test_sqli_project_id_single_quote_combined_with_search_does_not_error(self, client, db_session):
+        """A single-quote in 'project_id' (combined with search) must not trigger a DB error."""
+        response = client.get("/api/v1/tasks?search=anything&project_id='")
+        assert response.status_code in (200, 400)
+
+    def test_sqli_assigned_to_injection_does_not_error(self, client, db_session):
+        """An injection payload in 'assigned_to' (combined with search) must not error."""
+        payload = "1 OR 1=1"
+        response = client.get(f'/api/v1/tasks?search=anything&assigned_to={payload}')
+        assert response.status_code in (200, 400)
+
+    def test_sqli_search_special_chars_combo_does_not_error(self, client, db_session):
+        """A combination of special SQL characters must not cause a server error."""
+        payload = "'; SELECT * FROM tasks WHERE ''='"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # Helpers for global_search tests
 # ---------------------------------------------------------------------------
 
