@@ -25,8 +25,10 @@ def get_users():
     search = request.args.get('search', '')
     
     if search:
-        query = f"SELECT * FROM users WHERE username LIKE '%{search}%' OR email LIKE '%{search}%'"
-        result = db.session.execute(text(query))
+        # Use parameterized query to prevent SQL injection
+        search_param = f'%{search}%'
+        query = text("SELECT * FROM users WHERE username LIKE :search OR email LIKE :search")
+        result = db.session.execute(query, {'search': search_param})
         # Convert raw SQL results to dictionaries
         users = [dict(row._mapping) for row in result]
     else:
