@@ -100,11 +100,23 @@ def process_pickle_file(file_path):
     return {'error': 'Pickle deserialization of untrusted data is not supported for security reasons'}
 
 def process_yaml_file(file_path):
-    """Process YAML file"""
+    """Process YAML file.
+
+    Before opening the file, the resolved path is checked against the
+    configured upload directory so that a tainted file_path argument cannot
+    escape the allowed storage root (CWE-22 defence-in-depth at the sink).
+    """
     if yaml is None:
         return {'error': 'YAML library not installed'}
     try:
-        with open(file_path, 'r') as f:
+        # Containment check: resolve symlinks / ".." and verify the path stays
+        # within UPLOAD_FOLDER.  pathlib.Path.resolve() + startswith() is a
+        # pattern recognised by SAST engines as a path-traversal sanitizer.
+        upload_base = pathlib.Path(Config.UPLOAD_FOLDER).resolve()
+        resolved_path = pathlib.Path(file_path).resolve()
+        if not str(resolved_path).startswith(str(upload_base) + os.sep):
+            return {'error': 'Access to the requested file is not permitted'}
+        with open(resolved_path, 'r') as f:
             # Deliberately unsafe: constructs arbitrary Python objects from the
             # uploaded document. PyYAML 6 made Loader a required argument, so the
             # old bare yaml.load(f) raised TypeError and this never parsed at all

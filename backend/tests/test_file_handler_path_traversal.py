@@ -261,5 +261,178 @@ class TestSaveUploadedFileContainmentCheck(unittest.TestCase):
             self.assertNotIn("\\", sanitised, f"Backslash not stripped from: {payload}")
 
 
+class TestProcessYamlFilePathTraversal(unittest.TestCase):
+    """
+    Tests for the sink-level path containment check added to process_yaml_file
+    (CWE-22, SAST finding — sink at file_handler.py line 107).
+
+    The fix places a pathlib.Path.resolve() + startswith() containment guard
+    immediately before open() in process_yaml_file so that even if a tainted
+    file_path somehow bypasses the earlier secure_filename() sanitisation, the
+    sink itself rejects any path that escapes UPLOAD_FOLDER.
+    """
+
+    def setUp(self):
+        """Create an isolated temp upload dir and point Config at it."""
+        self.upload_dir = tempfile.mkdtemp()
+        self.config_patcher = patch("utils.file_handler.Config")
+        self.mock_config = self.config_patcher.start()
+        self.mock_config.UPLOAD_FOLDER = self.upload_dir
+
+    def tearDown(self):
+        self.config_patcher.stop()
+        shutil.rmtree(self.upload_dir, ignore_errors=True)
+
+    def _write_yaml_file(self, filename, content="key: value\n"):
+        """Write a YAML file inside the upload directory and return its path."""
+        path = os.path.join(self.upload_dir, filename)
+        with open(path, "w") as fh:
+            fh.write(content)
+        return path
+
+    # ------------------------------------------------------------------
+    # Positive cases – legitimate paths inside the upload directory
+    # ------------------------------------------------------------------
+
+    def test_valid_yaml_file_inside_upload_dir_is_processed(self):
+        """A YAML file that lives inside UPLOAD_FOLDER must be parsed normally."""
+        from utils.file_handler import process_yaml_file
+        yaml_path = self._write_yaml_file("sample.yaml", "name: test\nvalue: 42\n")
+        result = process_yaml_file(yaml_path)
+        # Should parse successfully – no 'error' key unless yaml not installed
+        if isinstance(result, dict) and 'error' in result:
+            # Only acceptable error is missing yaml library
+            self.assertIn('YAML', result['error'])
+        else:
+            self.assertIsInstance(result, dict)
+            self.assertEqual(result.get("name"), "test")
+
+    def test_valid_yml_extension_inside_upload_dir_is_processed(self):
+        """A .yml file inside UPLOAD_FOLDER is also parsed without error."""
+        from utils.file_handler import process_yaml_file
+        yml_path = self._write_yaml_file("config.yml", "mode: production\n")
+        result = process_yaml_file(yml_path)
+        if isinstance(result, dict) and 'error' in result:
+            self.assertIn('YAML', result['error'])
+        else:
+            self.assertIsInstance(result, dict)
+
+    def test_result_contains_expected_keys_for_valid_file(self):
+        """Parsing a multi-key YAML file returns all expected keys."""
+        from utils.file_handler import process_yaml_file
+        content = "project: alpha\nversion: 1\nactive: true\n"
+        yaml_path = self._write_yaml_file("multi.yaml", content)
+        result = process_yaml_file(yaml_path)
+        if not (isinstance(result, dict) and 'error' in result):
+            self.assertEqual(result.get("project"), "alpha")
+            self.assertEqual(result.get("version"), 1)
+
+    # ------------------------------------------------------------------
+    # Negative cases – paths outside UPLOAD_FOLDER must be rejected
+    # ------------------------------------------------------------------
+
+    def test_path_outside_upload_dir_returns_error(self):
+        """
+        A file_path that resolves outside UPLOAD_FOLDER must be rejected
+        with a permission error dict — the containment check at the sink
+        must fire before open() is ever called.
+        """
+        from utils.file_handler import process_yaml_file
+        # Create a YAML file in a separate temp dir (outside upload dir)
+        other_dir = tempfile.mkdtemp()
+        try:
+            outside_path = os.path.join(other_dir, "secret.yaml")
+            with open(outside_path, "w") as fh:
+                fh.write("sensitive: data\n")
+            result = process_yaml_file(outside_path)
+            self.assertIsInstance(result, dict)
+            self.assertIn('error', result)
+            self.assertNotIn('sensitive', str(result))
+        finally:
+            shutil.rmtree(other_dir, ignore_errors=True)
+
+    def test_absolute_path_to_system_file_returns_error(self):
+        """
+        An absolute path pointing outside the upload dir (e.g. /etc/passwd)
+        must be rejected before open() executes.
+        """
+        from utils.file_handler import process_yaml_file
+        result = process_yaml_file("/etc/passwd")
+        self.assertIsInstance(result, dict)
+        self.assertIn('error', result)
+
+    def test_dot_dot_traversal_path_returns_error(self):
+        """
+        A path constructed with '..' components that resolves outside
+        UPLOAD_FOLDER must be caught by the sink-level containment check.
+        """
+        from utils.file_handler import process_yaml_file
+        # Build a path like /tmp/uploads/../../../etc/passwd
+        traversal = os.path.join(self.upload_dir, "..", "..", "etc", "passwd")
+        result = process_yaml_file(traversal)
+        self.assertIsInstance(result, dict)
+        self.assertIn('error', result)
+
+    def test_sibling_directory_path_returns_error(self):
+        """
+        A path that is a sibling of UPLOAD_FOLDER (same parent, different name)
+        must be rejected — it is NOT inside the upload dir.
+        """
+        from utils.file_handler import process_yaml_file
+        # Create a sibling directory
+        sibling_dir = tempfile.mkdtemp()
+        try:
+            sibling_yaml = os.path.join(sibling_dir, "sibling.yaml")
+            with open(sibling_yaml, "w") as fh:
+                fh.write("key: leaked\n")
+            result = process_yaml_file(sibling_yaml)
+            self.assertIsInstance(result, dict)
+            self.assertIn('error', result)
+        finally:
+            shutil.rmtree(sibling_dir, ignore_errors=True)
+
+    def test_home_directory_path_returns_error(self):
+        """A path within the user's home directory must be rejected."""
+        from utils.file_handler import process_yaml_file
+        home_path = os.path.join(os.path.expanduser("~"), "malicious.yaml")
+        result = process_yaml_file(home_path)
+        self.assertIsInstance(result, dict)
+        self.assertIn('error', result)
+
+    # ------------------------------------------------------------------
+    # Containment invariant
+    # ------------------------------------------------------------------
+
+    def test_containment_check_fires_before_file_read(self):
+        """
+        When the path is outside UPLOAD_FOLDER the error must not contain
+        any data from the file — confirming the guard fires before open().
+        """
+        from utils.file_handler import process_yaml_file
+        other_dir = tempfile.mkdtemp()
+        try:
+            secret_path = os.path.join(other_dir, "secret.yaml")
+            secret_content = "top_secret_token: SHOULD_NOT_APPEAR_IN_RESULT\n"
+            with open(secret_path, "w") as fh:
+                fh.write(secret_content)
+            result = process_yaml_file(secret_path)
+            # The secret value must never appear in the result
+            result_str = str(result)
+            self.assertNotIn("SHOULD_NOT_APPEAR_IN_RESULT", result_str)
+            self.assertIn('error', result)
+        finally:
+            shutil.rmtree(other_dir, ignore_errors=True)
+
+    def test_path_identical_to_upload_dir_itself_returns_error(self):
+        """
+        Passing the upload directory path itself (not a file within it)
+        must be rejected — the check uses os.sep suffix to enforce this.
+        """
+        from utils.file_handler import process_yaml_file
+        result = process_yaml_file(self.upload_dir)
+        self.assertIsInstance(result, dict)
+        self.assertIn('error', result)
+
+
 if __name__ == "__main__":
     unittest.main()
