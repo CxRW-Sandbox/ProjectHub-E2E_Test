@@ -1,21 +1,27 @@
 """
 Security tests for stored XSS prevention in the admin dashboard (CWE-79).
 
-The vulnerability (SAST finding – Stored_XSS) was that the `role_badge`
-Jinja2 filter embedded the raw `role` value, which originates from the
-database, directly into an HTML string. The template then rendered the result
-with ``|safe``, bypassing Jinja2's auto-escaping. An attacker who could
-write an arbitrary role string to the database could inject executable
-JavaScript that would run in every admin's browser.
+The vulnerability (SAST finding – Stored_XSS) was that the ``admin.html``
+template rendered user role data from the database using the ``|safe`` filter
+(``{{ user.role|role_badge|safe }}``).  Even though the ``role_badge`` Jinja2
+filter applied ``html.escape()``, the explicit ``|safe`` in the template
+re-opened the taint sink that SAST scanners detect.
 
-The fix applies ``html.escape()`` to both the color class and the role text
-before embedding them in the HTML, and wraps the result in ``jinja2.Markup``
-so Jinja2 knows the string is already safely escaped.
+The fix:
+  1. Removes the ``|safe`` filter from the template (``templates/admin.html``,
+     line 106).  Because ``role_badge`` already returns a ``jinja2.Markup``
+     object, Jinja2 renders it without double-escaping — ``|safe`` is both
+     redundant and harmful.
+  2. Refines ``role_badge`` in ``utils/jinja_filters.py`` to normalise ``None``
+     to an empty string (rather than the literal text ``'None'``), coerce other
+     non-string types, and restrict the badge colour class to the hardcoded
+     allowlist without calling ``html.escape()`` on a trusted constant.
 
 These tests verify:
   1. The ``role_badge`` filter correctly escapes XSS payloads.
   2. The admin dashboard route renders without exposing unescaped role data.
   3. Legitimate role values still produce the expected badge markup.
+  4. The template source no longer contains the dangerous ``|safe`` pattern.
 """
 import pytest
 import sys
@@ -159,12 +165,14 @@ class TestRoleBadgeFilter:
         assert isinstance(result, Markup)
 
     def test_none_role_does_not_raise(self):
-        """Passing None as the role must not raise an exception."""
+        """Passing None as the role must not raise and must render an empty badge text."""
         ctx = _fake_context()
         try:
             result = role_badge(ctx, None)
             # Must not contain unescaped HTML
             assert '<script>' not in result
+            # None is normalised to '' — the literal text 'None' must not appear
+            assert '>None<' not in result
         except Exception as exc:
             pytest.fail(f"role_badge(None) raised {exc}")
 
@@ -323,3 +331,50 @@ class TestAdminDashboardStoredXSS:
             assert payload not in body, (
                 f"Unescaped XSS payload found in admin dashboard: {payload!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Template source verification – the |safe sink must be absent
+# ---------------------------------------------------------------------------
+
+class TestAdminTemplateSource:
+    """
+    Verify that the admin.html template no longer applies the ``|safe`` filter
+    to the role_badge output.
+
+    The ``|safe`` filter explicitly marks a value as trusted HTML, bypassing
+    Jinja2's auto-escaping and creating the taint sink that the SAST scanner
+    flags.  Because ``role_badge`` already returns a ``jinja2.Markup`` object
+    (which Jinja2 renders without escaping), ``|safe`` is both redundant and
+    the dangerous pattern that must be absent.
+    """
+
+    def test_admin_template_does_not_use_safe_on_role_badge(self):
+        """The admin.html template must not contain ``role_badge|safe``."""
+        import os
+        template_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'templates',
+            'admin.html',
+        )
+        with open(template_path, 'r', encoding='utf-8') as fh:
+            source = fh.read()
+        assert 'role_badge|safe' not in source, (
+            "admin.html still applies |safe to role_badge output — "
+            "this re-introduces the stored-XSS taint sink"
+        )
+
+    def test_admin_template_role_badge_filter_present(self):
+        """The role_badge filter must still be used in the template."""
+        import os
+        template_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'templates',
+            'admin.html',
+        )
+        with open(template_path, 'r', encoding='utf-8') as fh:
+            source = fh.read()
+        assert 'role_badge' in source, (
+            "The role_badge filter is missing from admin.html — "
+            "role data will not be rendered as a badge"
+        )
