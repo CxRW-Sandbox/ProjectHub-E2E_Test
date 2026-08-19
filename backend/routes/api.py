@@ -202,12 +202,21 @@ def get_project_tasks(project_id):
     status = request.args.get('status', '')
     
     if search:
-        query = f"SELECT * FROM tasks WHERE project_id = {project_id} AND (title LIKE '%{search}%' OR description LIKE '%{search}%')"
-        result = db.session.execute(text(query))
-        tasks = [dict(row) for row in result]
+        # Build a parameterized query to prevent SQL injection (CWE-89).
+        # The project_id is an integer (typed by the route), and search is
+        # bound as a named parameter — neither is interpolated into the SQL
+        # string.
+        search_param = f'%{search}%'
+        sql = text(
+            "SELECT * FROM tasks WHERE project_id = :project_id"
+            " AND (title LIKE :search OR description LIKE :search)"
+        )
+        result = db.session.execute(sql, {'project_id': project_id, 'search': search_param})
+        tasks = [dict(row._mapping) for row in result]
+        return jsonify({'tasks': tasks})
     else:
         tasks = Task.query.filter_by(project_id=project_id).all()
-    
+
     return jsonify({
         'tasks': [t.to_dict() for t in tasks]
     })
