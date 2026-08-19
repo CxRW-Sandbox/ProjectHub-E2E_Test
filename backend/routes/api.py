@@ -218,23 +218,28 @@ def get_tasks_api():
     search = request.args.get('search', '')
     project_id = request.args.get('project_id')
     assigned_to = request.args.get('assigned_to')
-    
+
+    # Use SQLAlchemy ORM for all query construction so that every user-supplied
+    # value is bound as a parameterized placeholder — never interpolated into SQL.
+    query = Task.query
+
     if search:
-        query = "SELECT * FROM tasks WHERE title LIKE '%{}%' OR description LIKE '%{}%'".format(search, search)
-        if project_id:
-            query += f" AND project_id = {project_id}"
-        if assigned_to:
-            query += f" AND assigned_to = {assigned_to}"
-        result = db.session.execute(text(query))
-        tasks = [dict(row) for row in result]
-    else:
-        query = Task.query
-        if project_id:
-            query = query.filter_by(project_id=project_id)
-        if assigned_to:
-            query = query.filter_by(assigned_to=assigned_to)
-        tasks = query.all()
-    
+        search_param = f'%{search}%'
+        query = query.filter(
+            db.or_(
+                Task.title.like(search_param),
+                Task.description.like(search_param),
+            )
+        )
+
+    if project_id:
+        query = query.filter_by(project_id=project_id)
+
+    if assigned_to:
+        query = query.filter_by(assigned_to=assigned_to)
+
+    tasks = query.all()
+
     return jsonify({
         'tasks': [t.to_dict() for t in tasks]
     })
