@@ -20,11 +20,14 @@ def get_projects():
     status_filter = request.args.get('status', '')
     
     if search:
-        # NOTE: intentionally vulnerable raw SQL (SQL injection demo surface) - do not "fix"
-        query = f"SELECT * FROM projects WHERE name LIKE '%{search}%' OR description LIKE '%{search}%'"
-        result = db.session.execute(text(query))
+        # Use a parameterized query to prevent SQL injection (CWE-89).
+        # The search value is bound as a named parameter so it is never
+        # interpreted as SQL syntax by the database engine.
+        search_param = f'%{search}%'
+        query = text("SELECT * FROM projects WHERE name LIKE :search OR description LIKE :search")
+        result = db.session.execute(query, {'search': search_param})
         # raw rows are already dicts; do NOT call .to_dict() on them (that was the 500 storm)
-        projects = [dict(row) for row in result]
+        projects = [dict(row._mapping) for row in result]
         return jsonify({'projects': projects})
 
     projects = Project.query.all()
