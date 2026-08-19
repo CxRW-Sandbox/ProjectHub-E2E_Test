@@ -1167,3 +1167,382 @@ class TestGlobalSearchSQLInjectionPrevention:
         after = client.get('/api/v1/projects').get_json()['projects']
         names = [p['name'] for p in after]
         assert 'injected_gs' not in names
+
+
+# ---------------------------------------------------------------------------
+# Helpers for /api/v1/projects/<project_id>/tasks tests
+# ---------------------------------------------------------------------------
+
+def _create_pt_user(db_session, username, email):
+    """Create a user for project-tasks endpoint tests."""
+    from models import User
+    existing = db_session.query(User).filter_by(username=username).first()
+    if existing:
+        return existing
+    user = User(username=username, email=email, role='team_member')
+    user.set_password('ptpass123')
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
+def _create_pt_project(db_session, name, owner_id):
+    """Create a project for project-tasks endpoint tests."""
+    from models import Project
+    project = Project(name=name, description='Test project', owner_id=owner_id, is_public=False)
+    db_session.add(project)
+    db_session.commit()
+    return project
+
+
+def _create_pt_task(db_session, title, description, project_id, created_by, status='pending'):
+    """Create a task for project-tasks endpoint tests."""
+    from models import Task
+    task = Task(
+        title=title,
+        description=description,
+        project_id=project_id,
+        created_by=created_by,
+        status=status,
+        priority='medium',
+    )
+    db_session.add(task)
+    db_session.commit()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Functional tests – GET /api/v1/projects/<project_id>/tasks search works
+# ---------------------------------------------------------------------------
+
+class TestGetProjectTasksSearchFunctionality:
+    """Verify that the search feature on /api/v1/projects/<id>/tasks works
+    correctly after the parameterized-query fix (CWE-89)."""
+
+    def test_no_search_returns_all_tasks_for_project(self, client, db_session):
+        """Without a search parameter all tasks for the project are returned."""
+        user = _create_pt_user(db_session, 'pt_func1', 'pt_func1@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 1', user.id)
+        _create_pt_task(db_session, 'Task One', 'first task', project.id, user.id)
+        _create_pt_task(db_session, 'Task Two', 'second task', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert 'tasks' in data
+        assert len(data['tasks']) >= 2
+
+    def test_search_by_title_returns_matching_task(self, client, db_session):
+        """A search term matching a task title returns only the matching task."""
+        user = _create_pt_user(db_session, 'pt_func2', 'pt_func2@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 2', user.id)
+        _create_pt_task(db_session, 'NeedleTask', 'haystack desc', project.id, user.id)
+        _create_pt_task(db_session, 'OtherTask', 'unrelated desc', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=NeedleTask')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'NeedleTask' in titles
+        assert 'OtherTask' not in titles
+
+    def test_search_by_description_returns_matching_task(self, client, db_session):
+        """A search term matching a description returns the correct task."""
+        user = _create_pt_user(db_session, 'pt_func3', 'pt_func3@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 3', user.id)
+        _create_pt_task(db_session, 'Generic Title PT', 'unique_pt_keyword_xyz', project.id, user.id)
+        _create_pt_task(db_session, 'Other Title PT', 'unrelated content', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=unique_pt_keyword_xyz')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Generic Title PT' in titles
+        assert 'Other Title PT' not in titles
+
+    def test_search_partial_match_finds_task(self, client, db_session):
+        """Partial search term matches substrings in title or description."""
+        user = _create_pt_user(db_session, 'pt_func4', 'pt_func4@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 4', user.id)
+        _create_pt_task(db_session, 'Implement Feature ABC', 'feature work', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=Feature')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Implement Feature ABC' in titles
+
+    def test_search_no_match_returns_empty_list(self, client, db_session):
+        """A search term that matches nothing returns an empty list."""
+        user = _create_pt_user(db_session, 'pt_func5', 'pt_func5@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 5', user.id)
+        _create_pt_task(db_session, 'Normal Task PT', 'normal desc', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=zzznomatch')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['tasks'] == []
+
+    def test_search_does_not_return_tasks_from_other_projects(self, client, db_session):
+        """Search results are scoped to the specified project_id."""
+        user = _create_pt_user(db_session, 'pt_func6', 'pt_func6@example.com')
+        proj_a = _create_pt_project(db_session, 'PT Proj A', user.id)
+        proj_b = _create_pt_project(db_session, 'PT Proj B', user.id)
+        _create_pt_task(db_session, 'Widget Task A', 'widget work', proj_a.id, user.id)
+        _create_pt_task(db_session, 'Widget Task B', 'widget work', proj_b.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{proj_a.id}/tasks?search=Widget')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Widget Task A' in titles
+        assert 'Widget Task B' not in titles
+
+    def test_empty_search_returns_all_tasks_for_project(self, client, db_session):
+        """An empty search string falls through to the ORM path and returns all tasks."""
+        user = _create_pt_user(db_session, 'pt_func7', 'pt_func7@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 7', user.id)
+        _create_pt_task(db_session, 'Empty Search Task PT', 'desc', project.id, user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert len(data['tasks']) >= 1
+
+    def test_response_contains_tasks_key(self, client, db_session):
+        """Response always contains the 'tasks' key."""
+        user = _create_pt_user(db_session, 'pt_func8', 'pt_func8@example.com')
+        project = _create_pt_project(db_session, 'PT Func Project 8', user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks')
+        assert response.status_code == 200
+        assert 'tasks' in response.get_json()
+
+    def test_nonexistent_project_returns_empty_tasks(self, client, db_session):
+        """A project_id that doesn't exist returns an empty tasks list."""
+        response = client.get('/api/v1/projects/999999/tasks')
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data['tasks'] == []
+
+
+# ---------------------------------------------------------------------------
+# Security tests – SQL injection payloads in search must be neutralised
+# ---------------------------------------------------------------------------
+
+class TestGetProjectTasksSQLInjectionPrevention:
+    """
+    Verify that SQL injection payloads in the 'search' parameter of
+    GET /api/v1/projects/<project_id>/tasks are treated as literal strings
+    and do NOT alter query structure or results (CWE-89 remediation).
+
+    Prior to the fix, line 205 used an f-string to interpolate the untrusted
+    'search' value directly into the SQL string passed to db.session.execute().
+    The fix replaces that with a SQLAlchemy text() query using named parameters
+    (:project_id, :search), so neither value is ever embedded in the SQL text.
+    """
+
+    def test_sqli_or_tautology_does_not_return_all_rows(self, client, db_session):
+        """
+        Classic OR-1=1 tautology must NOT return tasks from any project when
+        no real match exists.
+
+        Without the fix: the f-string would embed the payload and make the
+        WHERE clause always true, returning every task in the project.
+        With the fix: the entire string is bound as a LIKE parameter literal
+        and can only match a task whose title/description contains that text.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli1', 'pt_sqli1@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 1', user.id)
+        _create_pt_task(db_session, 'Secret PT Task', 'confidential', project.id, user.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Secret PT Task' not in titles
+
+    def test_sqli_single_quote_does_not_error(self, client, db_session):
+        """A bare single-quote in the search parameter must not raise a DB error."""
+        user = _create_pt_user(db_session, 'pt_sqli2', 'pt_sqli2@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 2', user.id)
+
+        response = client.get(f"/api/v1/projects/{project.id}/tasks?search='")
+        assert response.status_code == 200
+
+    def test_sqli_double_quote_does_not_error(self, client, db_session):
+        """A double-quote in the search parameter must not raise a DB error."""
+        user = _create_pt_user(db_session, 'pt_sqli3', 'pt_sqli3@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 3', user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search="')
+        assert response.status_code == 200
+
+    def test_sqli_semicolon_drop_table_does_not_affect_db(self, client, db_session):
+        """
+        A stacked DROP TABLE payload must not crash the server or destroy the
+        tasks table — database integrity must be preserved after the request.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli4', 'pt_sqli4@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 4', user.id)
+        _create_pt_task(db_session, 'PT Persistent Task', 'should survive', project.id, user.id)
+
+        payload = "x'; DROP TABLE tasks; --"
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        # The tasks table must still be intact and contain our task
+        get_all = client.get(f'/api/v1/projects/{project.id}/tasks')
+        assert get_all.status_code == 200
+        titles = [t['title'] for t in get_all.get_json()['tasks']]
+        assert 'PT Persistent Task' in titles
+
+    def test_sqli_comment_sequences_treated_literally(self, client, db_session):
+        """SQL comment sequences (-- and #) in the search must be treated as literals."""
+        user = _create_pt_user(db_session, 'pt_sqli5', 'pt_sqli5@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 5', user.id)
+        _create_pt_task(db_session, 'CommentTestTask PT', 'desc', project.id, user.id)
+
+        for payload in ["--", "#", "' --", "admin'--"]:
+            response = client.get(
+                f'/api/v1/projects/{project.id}/tasks?search={payload}'
+            )
+            assert response.status_code == 200, f"Payload '{payload}' caused an error"
+            data = response.get_json()
+            titles = [t['title'] for t in data['tasks']]
+            assert 'CommentTestTask PT' not in titles, (
+                f"Payload '{payload}' unexpectedly returned 'CommentTestTask PT'"
+            )
+
+    def test_sqli_union_select_does_not_return_extra_rows(self, client, db_session):
+        """
+        A UNION SELECT payload must not inject additional rows into the result.
+
+        Without the fix the UNION could append attacker-controlled columns to
+        the response.  With parameterized bindings the entire string is the LIKE
+        operand and matches nothing in the database.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli6', 'pt_sqli6@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 6', user.id)
+        _create_pt_task(db_session, 'Real PT Task', 'real desc', project.id, user.id)
+
+        payload = "x' UNION SELECT 1,2,3,4,5,6,7,8,9,10 --"
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        # The literal LIKE pattern won't match any real task
+        assert data['tasks'] == []
+
+    def test_sqli_or_always_true_numeric_tautology(self, client, db_session):
+        """Numeric tautology (1=1) must not cause all rows to be returned."""
+        user = _create_pt_user(db_session, 'pt_sqli7', 'pt_sqli7@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 7', user.id)
+        _create_pt_task(db_session, 'Tautology PT Task', 'confidential', project.id, user.id)
+
+        payload = "1' OR 1=1 --"
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Tautology PT Task' not in titles
+
+    def test_sqli_encoded_quote_does_not_error(self, client, db_session):
+        """
+        URL-encoded single quote (%27) in the search parameter must not cause
+        a server error.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli8', 'pt_sqli8@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 8', user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=%27')
+        assert response.status_code == 200
+
+    def test_sqli_backslash_does_not_error(self, client, db_session):
+        """Backslash sequences in the search must not cause a server error."""
+        user = _create_pt_user(db_session, 'pt_sqli9', 'pt_sqli9@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 9', user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=\\')
+        assert response.status_code == 200
+
+    def test_sqli_null_byte_does_not_error(self, client, db_session):
+        """
+        A null byte (%00) in the search parameter must not cause a server error.
+        Expressed as the URL-encoded form so no raw control byte is embedded in
+        this source file.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli10', 'pt_sqli10@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 10', user.id)
+
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search=%00')
+        # Must not crash with 500; 400 is acceptable if the app rejects it
+        assert response.status_code in (200, 400)
+
+    def test_sqli_special_chars_combo_does_not_error(self, client, db_session):
+        """A combination of special SQL characters must not cause a server error."""
+        user = _create_pt_user(db_session, 'pt_sqli11', 'pt_sqli11@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 11', user.id)
+
+        payload = "'; SELECT * FROM tasks WHERE ''='"
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+    def test_sqli_stacked_insert_does_not_create_row(self, client, db_session):
+        """
+        A stacked INSERT payload must not create a new task row.
+
+        Without the fix: SQLite's multi-statement execution could insert an
+        attacker-controlled task.  With parameterized queries the stacked
+        statement cannot be parsed out of the bound value.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli12', 'pt_sqli12@example.com')
+        project = _create_pt_project(db_session, 'PT SQLi Project 12', user.id)
+
+        payload = (
+            "'; INSERT INTO tasks "
+            "(title, description, project_id, created_by, status, priority) "
+            "VALUES ('injected_pt', 'injected', 1, 1, 'pending', 'low'); --"
+        )
+        response = client.get(f'/api/v1/projects/{project.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        # Verify the injected task was not created
+        all_tasks = client.get(f'/api/v1/projects/{project.id}/tasks').get_json()['tasks']
+        titles = [t['title'] for t in all_tasks]
+        assert 'injected_pt' not in titles
+
+    def test_sqli_cross_project_traversal_via_search(self, client, db_session):
+        """
+        An injection payload attempting to remove the project_id constraint
+        must not return tasks from other projects.
+
+        Without the fix: a payload like  x%' OR project_id = <other_id> --
+        embedded in the f-string would extend the WHERE clause and leak tasks
+        from any project.  With parameterized queries the entire payload is
+        bound as a LIKE literal and the project_id constraint is always enforced
+        via its own separate named parameter.
+        """
+        user = _create_pt_user(db_session, 'pt_sqli13', 'pt_sqli13@example.com')
+        proj_a = _create_pt_project(db_session, 'PT Proj A Traversal', user.id)
+        proj_b = _create_pt_project(db_session, 'PT Proj B Traversal', user.id)
+        _create_pt_task(db_session, 'Task Only In Proj B', 'confidential', proj_b.id, user.id)
+
+        # Try to escape the project scope by injecting into the search param
+        payload = f"x%' OR project_id = {proj_b.id} --"
+        response = client.get(f'/api/v1/projects/{proj_a.id}/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Task Only In Proj B' not in titles
