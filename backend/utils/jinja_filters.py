@@ -67,15 +67,24 @@ def format_file_size(context, size_bytes):
 
 @contextfilter
 def role_badge(context, role):
-    """Generate role badge HTML with HTML-escaped role value to prevent XSS."""
+    """Generate role badge HTML with HTML-escaped role value to prevent XSS.
+
+    The role value originates from the database and must be treated as
+    untrusted.  html.escape() is applied before embedding it in HTML, and the
+    result is wrapped in jinja2.Markup so Jinja2 renders it without
+    double-escaping.  The template must NOT apply the |safe filter to this
+    filter's output — Markup already signals that the content is pre-escaped.
+    """
     role_colors = {
         'admin': 'danger',
         'project_manager': 'primary',
         'team_member': 'secondary'
     }
-    color = role_colors.get(role, 'secondary')
-    # Use html.escape() to prevent stored XSS from untrusted role values stored in the DB.
-    # Markup() wraps the result so Jinja2 treats it as already-safe HTML,
-    # preserving the |safe usage in the template while encoding the role text.
-    return Markup(f'<span class="badge badge-{html.escape(color)}">{html.escape(str(role))}</span>')
+    # Normalise: None becomes empty string; other non-strings are coerced
+    role_str = '' if role is None else str(role)
+    # color comes from a hardcoded allowlist dict — always a trusted constant
+    color = role_colors.get(role_str, 'secondary')
+    # html.escape() encodes <, >, &, " so the untrusted role value cannot
+    # inject HTML tags or break out of the span's text content.
+    return Markup(f'<span class="badge badge-{color}">{html.escape(role_str)}</span>')
 
