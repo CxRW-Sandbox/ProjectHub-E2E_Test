@@ -1,7 +1,8 @@
 # Jinja2 template filters
-from jinja2 import contextfilter
+from jinja2 import contextfilter, Markup
 from datetime import datetime
 import hashlib
+import html
 
 @contextfilter
 def format_datetime(context, value, format='%Y-%m-%d %H:%M:%S'):
@@ -66,12 +67,15 @@ def format_file_size(context, size_bytes):
 
 @contextfilter
 def role_badge(context, role):
-    """Generate role badge HTML"""
+    """Generate role badge HTML with HTML-escaped role value to prevent XSS."""
     role_colors = {
         'admin': 'danger',
         'project_manager': 'primary',
         'team_member': 'secondary'
     }
     color = role_colors.get(role, 'secondary')
-    return f'<span class="badge badge-{color}">{role}</span>'
+    # Use html.escape() to prevent stored XSS from untrusted role values stored in the DB.
+    # Markup() wraps the result so Jinja2 treats it as already-safe HTML,
+    # preserving the |safe usage in the template while encoding the role text.
+    return Markup(f'<span class="badge badge-{html.escape(color)}">{html.escape(str(role))}</span>')
 
