@@ -5,7 +5,6 @@ import hashlib
 from werkzeug.utils import secure_filename
 from config import Config
 import xml.etree.ElementTree as ET
-import pickle
 try:
     import yaml
 except ImportError:
@@ -73,13 +72,15 @@ def process_xml_file(file_path):
         return {'error': str(e)}
 
 def process_pickle_file(file_path):
-    """Process pickle file"""
-    try:
-        with open(file_path, 'rb') as f:
-            data = pickle.load(f)
-        return data
-    except Exception as e:
-        return {'error': str(e)}
+    """Process pickle file.
+
+    Deserialization of untrusted data via pickle is inherently unsafe: a
+    crafted payload can execute arbitrary Python code during load.  Rather
+    than deserializing the file, this function refuses to process it and
+    returns an error so callers are informed without exposing the
+    application to remote code execution.
+    """
+    return {'error': 'Pickle deserialization of untrusted data is not supported for security reasons'}
 
 def process_yaml_file(file_path):
     """Process YAML file"""
