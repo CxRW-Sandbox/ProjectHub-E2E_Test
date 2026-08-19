@@ -532,3 +532,388 @@ class TestGetProjectsSQLInjectionPrevention:
         after = client.get('/api/v1/projects').get_json()['projects']
         names = [p['name'] for p in after]
         assert 'injected' not in names
+
+
+# ---------------------------------------------------------------------------
+# Helpers for /api/v1/tasks tests (get_tasks_api)
+# ---------------------------------------------------------------------------
+
+def _create_task_for_api(db_session, title, description, project_id, created_by,
+                          status='pending', assigned_to=None):
+    """Create a Task row directly in the test database."""
+    from models import Task
+    task = Task(
+        title=title,
+        description=description,
+        project_id=project_id,
+        created_by=created_by,
+        status=status,
+        priority='medium',
+        assigned_to=assigned_to,
+    )
+    db_session.add(task)
+    db_session.commit()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Functional tests – /api/v1/tasks search works correctly after fix
+# ---------------------------------------------------------------------------
+
+class TestGetTasksApiSearchFunctionality:
+    """
+    Verify that the search feature on /api/v1/tasks (get_tasks_api) works
+    correctly after the parameterized-query fix (CWE-89).
+
+    The old implementation built raw SQL via .format() string interpolation.
+    The fix replaces it with SQLAlchemy ORM filter() / .like() calls so that
+    every user-supplied value is bound as a parameter and never interpreted
+    as SQL syntax.
+    """
+
+    def test_get_tasks_no_search_returns_all(self, client, db_session):
+        """Without a search parameter all tasks are returned."""
+        owner = _create_owner(db_session, 'tasks_func_owner', 'tasks_func@example.com')
+        project = _create_project(db_session, 'Tasks Func Project', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Alpha Task', 'first', project.id, owner.id)
+        _create_task_for_api(db_session, 'Beta Task', 'second', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert 'tasks' in data
+        assert len(data['tasks']) >= 2
+
+    def test_get_tasks_search_by_title(self, client, db_session):
+        """Search term matching a task title returns only matching tasks."""
+        owner = _create_owner(db_session, 'tasks_func_owner2', 'tasks_func2@example.com')
+        project = _create_project(db_session, 'Tasks Func Project 2', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Unique Needle Task', 'some desc', project.id, owner.id)
+        _create_task_for_api(db_session, 'Other Task', 'other desc', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks?search=Needle')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Unique Needle Task' in titles
+        assert 'Other Task' not in titles
+
+    def test_get_tasks_search_by_description(self, client, db_session):
+        """Search term matching a task description returns that task."""
+        owner = _create_owner(db_session, 'tasks_func_owner3', 'tasks_func3@example.com')
+        project = _create_project(db_session, 'Tasks Func Project 3', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Plain Title', 'contains_searchable_kw', project.id, owner.id)
+        _create_task_for_api(db_session, 'Another Title', 'unrelated', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks?search=searchable_kw')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Plain Title' in titles
+        assert 'Another Title' not in titles
+
+    def test_get_tasks_search_partial_match(self, client, db_session):
+        """Partial search terms match substrings in title or description."""
+        owner = _create_owner(db_session, 'tasks_func_owner4', 'tasks_func4@example.com')
+        project = _create_project(db_session, 'Tasks Func Project 4', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Implement Feature X', 'feature desc', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks?search=Feature')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Implement Feature X' in titles
+
+    def test_get_tasks_search_no_match_returns_empty(self, client, db_session):
+        """A search term that matches nothing returns an empty list."""
+        owner = _create_owner(db_session, 'tasks_func_owner5', 'tasks_func5@example.com')
+        project = _create_project(db_session, 'Tasks Func Project 5', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Normal Task', 'normal desc', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks?search=zzznomatch')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['tasks'] == []
+
+    def test_get_tasks_filtered_by_project_id(self, client, db_session):
+        """Filtering by project_id returns only tasks from that project."""
+        owner = _create_owner(db_session, 'tasks_func_owner6', 'tasks_func6@example.com')
+        project_a = _create_project(db_session, 'Tasks Project A', 'desc', owner.id)
+        project_b = _create_project(db_session, 'Tasks Project B', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Task in A', 'desc', project_a.id, owner.id)
+        _create_task_for_api(db_session, 'Task in B', 'desc', project_b.id, owner.id)
+
+        response = client.get(f'/api/v1/tasks?project_id={project_a.id}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Task in A' in titles
+        assert 'Task in B' not in titles
+
+    def test_get_tasks_search_combined_with_project_id(self, client, db_session):
+        """search and project_id filters can be combined correctly."""
+        owner = _create_owner(db_session, 'tasks_func_owner7', 'tasks_func7@example.com')
+        project_a = _create_project(db_session, 'Combined Tasks Project A', 'desc', owner.id)
+        project_b = _create_project(db_session, 'Combined Tasks Project B', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Widget Task A', 'widget work', project_a.id, owner.id)
+        _create_task_for_api(db_session, 'Widget Task B', 'widget work', project_b.id, owner.id)
+
+        response = client.get(f'/api/v1/tasks?search=Widget&project_id={project_a.id}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Widget Task A' in titles
+        assert 'Widget Task B' not in titles
+
+    def test_get_tasks_response_contains_tasks_key(self, client, db_session):
+        """Response always contains the 'tasks' key."""
+        response = client.get('/api/v1/tasks')
+        assert response.status_code == 200
+        assert 'tasks' in response.get_json()
+
+    def test_get_tasks_response_task_has_expected_fields(self, client, db_session):
+        """Each task in the response has the expected fields from Task.to_dict()."""
+        owner = _create_owner(db_session, 'tasks_func_owner8', 'tasks_func8@example.com')
+        project = _create_project(db_session, 'Field Check Project', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Field Check Task', 'checking fields', project.id, owner.id)
+
+        response = client.get('/api/v1/tasks?search=Field Check Task')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert len(data['tasks']) >= 1
+        task = data['tasks'][0]
+        for field in ('id', 'title', 'description', 'project_id', 'status', 'priority'):
+            assert field in task, f"Expected field '{field}' missing from task dict"
+
+
+# ---------------------------------------------------------------------------
+# Security tests – SQL injection payloads in /api/v1/tasks must be rejected
+# ---------------------------------------------------------------------------
+
+class TestGetTasksApiSQLInjectionPrevention:
+    """
+    Verify that SQL injection payloads in the 'search', 'project_id', and
+    'assigned_to' query parameters of /api/v1/tasks are treated as literal
+    strings and do not affect the query structure or results (CWE-89).
+
+    The taint flow being tested:
+      SOURCE  → request.args.get('search', '')       [line 218]
+      SINK    → db.session.execute(text(query))       [was line 228, now eliminated]
+
+    The fix replaces the string-format SQL construction with SQLAlchemy ORM
+    filter() / .like() calls, which bind all values as named parameters so
+    the database driver never interprets them as SQL syntax.
+    """
+
+    def test_sqli_search_or_tautology_does_not_return_all_rows(self, client, db_session):
+        """
+        Classic OR 1=1 tautology in 'search' must NOT return all rows when no
+        real match exists.
+
+        Without parameterization  ' OR '1'='1  would expand to a tautology and
+        match every row.  With the ORM fix the string is the bound LIKE value.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner1', 'tasks_sqli1@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 1', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Secret Task', 'confidential', project.id, owner.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Secret Task' not in titles
+
+    def test_sqli_search_single_quote_does_not_error(self, client, db_session):
+        """A bare single-quote in 'search' must not raise a DB error."""
+        response = client.get("/api/v1/tasks?search='")
+        assert response.status_code == 200
+
+    def test_sqli_search_double_quote_does_not_error(self, client, db_session):
+        """A double-quote in 'search' must not raise a DB error."""
+        response = client.get('/api/v1/tasks?search="')
+        assert response.status_code == 200
+
+    def test_sqli_search_semicolon_drop_table_does_not_affect_db(self, client, db_session):
+        """
+        A semicolon followed by DROP TABLE must not cause any error or affect
+        the database — the tasks table must remain intact.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner2', 'tasks_sqli2@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 2', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Persistent Task', 'must survive', project.id, owner.id)
+
+        payload = "x'; DROP TABLE tasks; --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        # The tasks table must still exist and the task is still there
+        get_all = client.get('/api/v1/tasks')
+        assert get_all.status_code == 200
+        titles = [t['title'] for t in get_all.get_json()['tasks']]
+        assert 'Persistent Task' in titles
+
+    def test_sqli_search_comment_sequences_treated_literally(self, client, db_session):
+        """SQL comment sequences (-- and #) in 'search' must be treated as literals."""
+        owner = _create_owner(db_session, 'tasks_sqli_owner3', 'tasks_sqli3@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 3', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Comment Test Task', 'desc', project.id, owner.id)
+
+        for payload in ["--", "#", "' --", "admin'--"]:
+            response = client.get(f'/api/v1/tasks?search={payload}')
+            assert response.status_code == 200, f"Payload '{payload}' caused an error"
+            data = response.get_json()
+            titles = [t['title'] for t in data['tasks']]
+            assert 'Comment Test Task' not in titles, (
+                f"Payload '{payload}' unexpectedly returned 'Comment Test Task'"
+            )
+
+    def test_sqli_search_union_select_does_not_return_extra_rows(self, client, db_session):
+        """
+        A UNION SELECT payload in 'search' must not inject additional rows.
+        The parameterized ORM LIKE treats the whole string as a literal value.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner4', 'tasks_sqli4@example.com')
+
+        payload = "x' UNION SELECT 1,2,3,4,5,6,7,8,9,10 --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        # No real tasks should match the literal LIKE pattern
+        assert data['tasks'] == []
+
+    def test_sqli_search_stacked_queries_do_not_insert_row(self, client, db_session):
+        """A stacked INSERT query in 'search' must not create a new task row."""
+        owner = _create_owner(db_session, 'tasks_sqli_owner5', 'tasks_sqli5@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 5', 'desc', owner.id)
+
+        before_count = len(client.get('/api/v1/tasks').get_json()['tasks'])
+
+        payload = (
+            "x'; INSERT INTO tasks (title, description, project_id, created_by, "
+            "status, priority) VALUES ('injected', 'injected', 1, 1, 'pending', 'low'); --"
+        )
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        after = client.get('/api/v1/tasks').get_json()['tasks']
+        titles = [t['title'] for t in after]
+        assert 'injected' not in titles
+
+    def test_sqli_search_encoded_quote_does_not_error(self, client, db_session):
+        """URL-encoded single quote (%27) in 'search' must not cause a server error."""
+        response = client.get('/api/v1/tasks?search=%27')
+        assert response.status_code == 200
+
+    def test_sqli_search_null_byte_does_not_error(self, client, db_session):
+        """
+        A null byte (%00) in 'search' must not cause a server error.
+        The URL-encoded form is used here so no raw control byte is embedded
+        in this source file.
+        """
+        response = client.get('/api/v1/tasks?search=%00')
+        assert response.status_code in (200, 400)
+
+    def test_sqli_search_backslash_does_not_error(self, client, db_session):
+        """Backslash sequences in 'search' must not cause a server error."""
+        response = client.get("/api/v1/tasks?search=\\")
+        assert response.status_code == 200
+
+    def test_sqli_search_special_chars_combo_does_not_error(self, client, db_session):
+        """A combination of special characters must not cause a server error."""
+        payload = "'; SELECT * FROM tasks WHERE ''='"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+    def test_sqli_search_numeric_tautology_does_not_return_all_rows(self, client, db_session):
+        """
+        Numeric tautology payload in 'search' must not return rows that do not
+        literally contain that string.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner6', 'tasks_sqli6@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 6', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Numeric Tautology Task', 'desc', project.id, owner.id)
+
+        payload = "1' OR 1=1 --"
+        response = client.get(f'/api/v1/tasks?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t['title'] for t in data['tasks']]
+        assert 'Numeric Tautology Task' not in titles
+
+    def test_sqli_project_id_non_integer_does_not_error(self, client, db_session):
+        """
+        A non-integer 'project_id' (e.g. injection payload) must not cause a
+        server error.  The ORM filter_by safely handles non-integer values.
+        """
+        payload = "1 OR 1=1"
+        response = client.get(f'/api/v1/tasks?project_id={payload}')
+        # Should not return a 500 — 200 (no rows) or 400 (type error) is acceptable
+        assert response.status_code in (200, 400)
+
+    def test_sqli_project_id_single_quote_does_not_error(self, client, db_session):
+        """A single-quote in 'project_id' must not trigger a DB error."""
+        response = client.get("/api/v1/tasks?project_id='")
+        assert response.status_code in (200, 400)
+
+    def test_sqli_project_id_union_payload_does_not_return_extra_rows(self, client, db_session):
+        """
+        A UNION SELECT payload in 'project_id' must not inject additional rows.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner7', 'tasks_sqli7@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 7', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Real Task 7', 'real desc', project.id, owner.id)
+
+        payload = "1 UNION SELECT 1,2,3,4,5,6,7,8,9,10 --"
+        response = client.get(f'/api/v1/tasks?project_id={payload}')
+        assert response.status_code in (200, 400)
+        if response.status_code == 200:
+            data = response.get_json()
+            # All returned tasks must be real Task model instances (have valid int IDs)
+            for task in data['tasks']:
+                assert isinstance(task['id'], int)
+
+    def test_sqli_assigned_to_non_integer_does_not_error(self, client, db_session):
+        """
+        A non-integer 'assigned_to' (e.g. injection payload) must not cause a
+        server error.  The ORM filter_by safely handles non-integer values.
+        """
+        payload = "1 OR 1=1"
+        response = client.get(f'/api/v1/tasks?assigned_to={payload}')
+        assert response.status_code in (200, 400)
+
+    def test_sqli_assigned_to_single_quote_does_not_error(self, client, db_session):
+        """A single-quote in 'assigned_to' must not trigger a DB error."""
+        response = client.get("/api/v1/tasks?assigned_to='")
+        assert response.status_code in (200, 400)
+
+    def test_sqli_search_and_project_id_combined_payload(self, client, db_session):
+        """
+        Injection payloads in both 'search' and 'project_id' simultaneously
+        must not cause an error or return unexpected rows.
+        """
+        owner = _create_owner(db_session, 'tasks_sqli_owner8', 'tasks_sqli8@example.com')
+        project = _create_project(db_session, 'SQLi Tasks Project 8', 'desc', owner.id)
+        _create_task_for_api(db_session, 'Combined Payload Task', 'desc', project.id, owner.id)
+
+        search_payload = "' OR '1'='1"
+        pid_payload = "1 OR 1=1"
+        response = client.get(
+            f'/api/v1/tasks?search={search_payload}&project_id={pid_payload}'
+        )
+        assert response.status_code in (200, 400)
+        if response.status_code == 200:
+            data = response.get_json()
+            titles = [t['title'] for t in data['tasks']]
+            assert 'Combined Payload Task' not in titles
