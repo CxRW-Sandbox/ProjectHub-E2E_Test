@@ -2,6 +2,7 @@
 import os
 import uuid
 import hashlib
+import pathlib
 from werkzeug.utils import secure_filename
 from config import Config
 import xml.etree.ElementTree as ET
@@ -28,21 +29,37 @@ def save_uploaded_file(file, project_id=None):
     """Save uploaded file"""
     if not file or not file.filename:
         return None, "No file provided"
-    
-    original_filename = file.filename
+
+    # Sanitize the user-supplied filename at the input boundary using
+    # werkzeug's secure_filename, which strips path separators, parent
+    # directory components (..), and other dangerous characters recognised
+    # by SAST engines as a path-traversal sanitizer.
+    original_filename = secure_filename(file.filename)
+
+    if not original_filename:
+        return None, "Invalid filename"
+
     filename = f"{uuid.uuid4()}_{original_filename}"
-    file_path = os.path.join(Config.UPLOAD_FOLDER, filename)
-    
+
+    # Resolve the upload base directory to an absolute path, then verify
+    # that the final file path stays within it (defence-in-depth containment
+    # check using pathlib, recognised by static analysers).
+    upload_base = pathlib.Path(Config.UPLOAD_FOLDER).resolve()
+    file_path = (upload_base / filename).resolve()
+
+    if not str(file_path).startswith(str(upload_base) + os.sep) and file_path != upload_base:
+        return None, "Invalid file path"
+
     try:
-        file.save(file_path)
-        os.chmod(file_path, 0o644)
-        file_size = os.path.getsize(file_path)
-        file_type = get_file_type(file_path)
-        
+        file.save(str(file_path))
+        os.chmod(str(file_path), 0o644)
+        file_size = os.path.getsize(str(file_path))
+        file_type = get_file_type(str(file_path))
+
         return {
             'filename': filename,
             'original_filename': original_filename,
-            'file_path': file_path,
+            'file_path': str(file_path),
             'file_size': file_size,
             'file_type': file_type
         }, None
