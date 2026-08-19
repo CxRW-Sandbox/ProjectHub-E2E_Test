@@ -130,8 +130,14 @@ def search_messages():
         return jsonify({'error': 'Search query required'}), 400
     
     from sqlalchemy import text
-    sql_query = f"SELECT * FROM messages WHERE content LIKE '%{query}%' OR subject LIKE '%{query}%'"
-    result = db.session.execute(text(sql_query))
+    # Use a parameterized query to prevent SQL injection (CWE-89).
+    # The search term is bound as a named parameter; the database driver
+    # handles quoting, so user input never modifies the query structure.
+    search_pattern = f"%{query}%"
+    sql_query = text(
+        "SELECT * FROM messages WHERE content LIKE :pattern OR subject LIKE :pattern"
+    )
+    result = db.session.execute(sql_query, {"pattern": search_pattern})
     messages = [dict(row) for row in result]
     
     return jsonify({
