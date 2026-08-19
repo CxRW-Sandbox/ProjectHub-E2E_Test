@@ -244,3 +244,291 @@ class TestGetUsersSQLInjectionPrevention:
         """URL-encoded single quote (%27) must not cause a server error."""
         response = client.get('/api/v1/users?search=%27')
         assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Helpers for projects tests
+# ---------------------------------------------------------------------------
+
+def _create_project(db_session, name, description, owner_id):
+    """Create a project directly in the test database."""
+    from models import Project
+    project = Project(
+        name=name,
+        description=description,
+        owner_id=owner_id,
+        is_public=False,
+    )
+    db_session.add(project)
+    db_session.commit()
+    return project
+
+
+def _create_owner(db_session, username='owner', email='owner@example.com'):
+    """Create a user to own test projects."""
+    from models import User
+    # Avoid duplicates when called multiple times
+    existing = db_session.query(User).filter_by(username=username).first()
+    if existing:
+        return existing
+    user = User(username=username, email=email, role='team_member')
+    user.set_password('ownerpass123')
+    db_session.add(user)
+    db_session.commit()
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Functional tests – /api/v1/projects search works correctly
+# ---------------------------------------------------------------------------
+
+class TestGetProjectsSearchFunctionality:
+    """Verify that the search feature on /api/v1/projects works correctly
+    after the parameterized-query fix (CWE-89)."""
+
+    def test_get_projects_no_search_returns_all(self, client, db_session):
+        """Without a search parameter all projects are returned."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'Alpha', 'First project', owner.id)
+        _create_project(db_session, 'Beta', 'Second project', owner.id)
+
+        response = client.get('/api/v1/projects')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert 'projects' in data
+        assert len(data['projects']) >= 2
+
+    def test_get_projects_search_by_name(self, client, db_session):
+        """Search term matching a project name returns the correct project."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'UniqueAlpha', 'Some description', owner.id)
+        _create_project(db_session, 'TotallyOther', 'Other description', owner.id)
+
+        response = client.get('/api/v1/projects?search=UniqueAlpha')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'UniqueAlpha' in names
+        assert 'TotallyOther' not in names
+
+    def test_get_projects_search_by_description(self, client, db_session):
+        """Search term matching a description returns the correct project."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'ProjA', 'Contains needle keyword', owner.id)
+        _create_project(db_session, 'ProjB', 'Nothing special here', owner.id)
+
+        response = client.get('/api/v1/projects?search=needle')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'ProjA' in names
+        assert 'ProjB' not in names
+
+    def test_get_projects_search_partial_match(self, client, db_session):
+        """Partial search term matches substrings in name or description."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'PartialMatchProject', 'desc', owner.id)
+
+        response = client.get('/api/v1/projects?search=PartialMatch')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'PartialMatchProject' in names
+
+    def test_get_projects_search_no_match_returns_empty(self, client, db_session):
+        """A search term that matches nothing returns an empty list."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'SomeProject', 'some description', owner.id)
+
+        response = client.get('/api/v1/projects?search=zzznomatch')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['projects'] == []
+
+    def test_get_projects_empty_search_returns_all(self, client, db_session):
+        """An explicitly empty search string returns all projects (ORM path)."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'EmptySearchProject', 'desc', owner.id)
+
+        response = client.get('/api/v1/projects?search=')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert len(data['projects']) >= 1
+
+    def test_get_projects_response_contains_projects_key(self, client, db_session):
+        """Response always contains the 'projects' key."""
+        response = client.get('/api/v1/projects')
+        assert response.status_code == 200
+        assert 'projects' in response.get_json()
+
+    def test_get_projects_response_project_has_expected_fields(self, client, db_session):
+        """Each project in the response has the expected fields."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'FieldCheckProject', 'field description', owner.id)
+
+        response = client.get('/api/v1/projects?search=FieldCheckProject')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert len(data['projects']) >= 1
+        project = data['projects'][0]
+        for field in ('id', 'name', 'description', 'owner_id'):
+            assert field in project, f"Expected field '{field}' missing from project dict"
+
+
+# ---------------------------------------------------------------------------
+# Security tests – SQL injection payloads must NOT alter query behaviour
+# ---------------------------------------------------------------------------
+
+class TestGetProjectsSQLInjectionPrevention:
+    """
+    Verify that SQL injection payloads in the 'search' parameter of
+    /api/v1/projects are treated as literal strings and do not affect
+    the query's structure or results (CWE-89 remediation).
+
+    With the parameterized fix each payload is bound as a LIKE pattern value,
+    so none of these should raise a database error or return unexpected rows.
+    """
+
+    def test_sqli_or_true_tautology_does_not_return_all_rows(self, client, db_session):
+        """
+        Classic OR-1=1 tautology must NOT return all rows when no real match exists.
+
+        Without parameterization  ' OR '1'='1  would match every row.
+        With parameterization the entire string is the LIKE pattern, so
+        it can only match a project whose name/description literally contains that text.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'SecretProject', 'confidential', owner.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'SecretProject' not in names
+
+    def test_sqli_single_quote_does_not_error(self, client, db_session):
+        """A bare single-quote in the search parameter must not raise a DB error."""
+        response = client.get("/api/v1/projects?search='")
+        assert response.status_code == 200
+
+    def test_sqli_double_quote_does_not_error(self, client, db_session):
+        """A double-quote in the search parameter must not raise a DB error."""
+        response = client.get('/api/v1/projects?search="')
+        assert response.status_code == 200
+
+    def test_sqli_semicolon_drop_table_does_not_execute(self, client, db_session):
+        """
+        A semicolon followed by DROP TABLE must not cause any error or
+        affect the database.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'DropProof', 'should survive', owner.id)
+
+        payload = "x'; DROP TABLE projects; --"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+        # The projects table must still exist and contain our project
+        get_all = client.get('/api/v1/projects')
+        assert get_all.status_code == 200
+        names = [p['name'] for p in get_all.get_json()['projects']]
+        assert 'DropProof' in names
+
+    def test_sqli_comment_sequence_does_not_alter_results(self, client, db_session):
+        """SQL comment sequences (-- and #) in the search must be treated literally."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'CommentTestProject', 'desc', owner.id)
+
+        for payload in ["--", "#", "' --", "admin'--"]:
+            response = client.get(f'/api/v1/projects?search={payload}')
+            assert response.status_code == 200, f"Payload '{payload}' caused an error"
+            data = response.get_json()
+            names = [p['name'] for p in data['projects']]
+            assert 'CommentTestProject' not in names, (
+                f"Payload '{payload}' unexpectedly returned 'CommentTestProject'"
+            )
+
+    def test_sqli_union_select_does_not_return_extra_rows(self, client, db_session):
+        """
+        A UNION SELECT payload must not inject additional rows into the result.
+        The parameterized LIKE treats the whole string as a literal value.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'UnionProof', 'desc', owner.id)
+
+        payload = "x' UNION SELECT 1,2,3,4,5,6,7 --"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        # No rows should match the literal LIKE pattern containing UNION SELECT
+        assert data['projects'] == []
+
+    def test_sqli_or_always_true_numeric(self, client, db_session):
+        """
+        Numeric tautology payload must not return rows that don't match literally.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'NumericTautologyProject', 'desc', owner.id)
+
+        payload = "1' OR 1=1 --"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p['name'] for p in data['projects']]
+        assert 'NumericTautologyProject' not in names
+
+    def test_sqli_encoded_quote_does_not_error(self, client, db_session):
+        """URL-encoded single quote (%27) must not cause a server error."""
+        response = client.get('/api/v1/projects?search=%27')
+        assert response.status_code == 200
+
+    def test_sqli_backslash_does_not_error(self, client, db_session):
+        """Backslash sequences in the search must not cause a server error."""
+        response = client.get("/api/v1/projects?search=\\")
+        assert response.status_code == 200
+
+    def test_sqli_special_chars_combo_does_not_error(self, client, db_session):
+        """A combination of special characters must not cause a server error."""
+        payload = "'; SELECT * FROM projects WHERE ''='"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+    def test_sqli_null_byte_does_not_error(self, client, db_session):
+        """
+        A null byte (%00) in the search parameter must not cause a server error.
+        Expressed as the URL-encoded form so no raw control byte is embedded in
+        this source file.
+        """
+        response = client.get('/api/v1/projects?search=%00')
+        # Must not crash with 500
+        assert response.status_code in (200, 400)
+
+    def test_sqli_stacked_queries_do_not_insert_row(self, client, db_session):
+        """
+        A stacked INSERT query must not create a new project row.
+        """
+        owner = _create_owner(db_session)
+
+        # Count rows before the injection attempt
+        before = client.get('/api/v1/projects').get_json()['projects']
+        before_count = len(before)
+
+        payload = "x'; INSERT INTO projects (name, description, owner_id) VALUES ('injected', 'injected', 1); --"
+        response = client.get(f'/api/v1/projects?search={payload}')
+        assert response.status_code == 200
+
+        # Count rows after; the injected row must not have been inserted
+        after = client.get('/api/v1/projects').get_json()['projects']
+        names = [p['name'] for p in after]
+        assert 'injected' not in names
