@@ -1,0 +1,16 @@
+# Testing dependencies for ProjectHub Backend
+# Runs on Python 3.11, same as the application (see Dockerfile).
+# Tests use an in-memory SQLite database, so PostgreSQL is not required.
+
+# Keep these identical to requirements.txt -- tests are not useful if they run
+# against a different dependency set than the application.
+-r requirements.txt
+
+# Testing frameworks
+pytest==6.2.5
+pytest-cov==3.0.0
+pytest-flask==1.2.0
+
+# Note: tests use SQLite in-memory rather than PostgreSQL. Config disables the
+# SQLALCHEMY_POOL_* settings for SQLite URIs, because SQLite's StaticPool
+# rejects pool_size / max_overflow / pool_timeout.

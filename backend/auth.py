@@ -1,0 +1,91 @@
+# Authentication utilities
+import jwt
+from datetime import datetime, timedelta
+from functools import wraps
+from flask import request, jsonify
+from config import Config
+from models import User, db
+from utils.logger import log_login_attempt, log_user_action
+
+JWT_SECRET = Config.JWT_SECRET_KEY
+
+def generate_token(user_id, username):
+    """Generate JWT token"""
+    payload = {
+        'user_id': user_id,
+        'username': username,
+        'iat': datetime.utcnow(),
+    }
+    
+    token = jwt.encode(payload, JWT_SECRET, algorithm=Config.JWT_ALGORITHM)
+    if isinstance(token, bytes):
+        token = token.decode('utf-8')
+    return token
+
+def verify_token(token):
+    """Verify JWT token"""
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[Config.JWT_ALGORITHM])
+        return payload
+    except jwt.InvalidTokenError:
+        return None
+
+def get_current_user():
+    """Get current user from token"""
+    token = None
+    
+    if 'Authorization' in request.headers:
+        auth_header = request.headers['Authorization']
+        if auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+        else:
+            token = auth_header
+    
+    if not token:
+        token = request.args.get('token')
+    
+    if not token:
+        token = request.form.get('token')
+    
+    if not token:
+        return None
+    
+    payload = verify_token(token)
+    if not payload:
+        return None
+    
+    user = User.query.get(payload.get('user_id'))
+    return user
+
+def require_auth(f):
+    """Decorator to require authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({'error': 'Authentication required'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+def require_role(required_role):
+    """Decorator to require specific role"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({'error': 'Authentication required'}), 401
+            
+            if user.role == 'admin':
+                return f(*args, **kwargs)
+            
+            if required_role == 'project_manager' and user.role in ['admin', 'project_manager']:
+                return f(*args, **kwargs)
+            
+            if user.role != required_role:
+                return jsonify({'error': 'Insufficient permissions'}), 403
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+

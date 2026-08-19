@@ -1,0 +1,92 @@
+services:
+  db:
+    image: postgres:10
+    environment:
+      POSTGRES_USER: projecthub
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: projecthub
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Override with DB_PORT if 5432 is already taken by a local Postgres.
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - app-network
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://projecthub:password123@db:5432/projecthub
+      DB_HOST: db
+      JWT_SECRET: secret_key_12345
+      AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
+      AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+    expose:
+      - 5000
+    volumes:
+      # ":z" relabels for SELinux hosts (Fedora/RHEL under Podman); Docker and
+      # Docker Desktop ignore the flag on platforms without SELinux.
+      - ../backend:/app:z
+      - uploads:/app/uploads
+      - logs:/app/logs
+    depends_on:
+      - db
+    # NOTE: legacy "links: [db:db]" was removed here. Podman's API rejects it
+    # outright ("bad parameter: link is not supported"), and it is redundant --
+    # app-network already resolves the "db" hostname on both engines.
+    networks:
+      - app-network
+    user: root
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    expose:
+      - 3000
+    environment:
+      # Leave empty to use dynamic host detection in api.js
+      # Or set explicitly: REACT_APP_API_URL: http://YOUR_SERVER_IP:5000/api
+      REACT_APP_API_URL: ""
+    volumes:
+      - ../frontend:/app:z
+      - /app/node_modules
+      - frontend_build:/build-output
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "test", "-f", "/build-output/.ready", "-a", "-f", "/build-output/index.html"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:1.14
+    ports:
+      # Rootless Podman on Linux cannot bind privileged ports; set HTTP_PORT
+      # (e.g. HTTP_PORT=8080) instead of tuning ip_unprivileged_port_start.
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro,z
+      - frontend_build:/usr/share/nginx/html
+    depends_on:
+      frontend:
+        condition: service_healthy
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:
+  uploads:
+  logs:
+  frontend_build:
+
+networks:
+  app-network:
+    driver: bridge
+

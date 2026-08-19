@@ -1,0 +1,26 @@
+# These pins are INTENTIONALLY outdated -- known CVEs here are the point of the
+# exercise. The only hard constraint is that everything must still install and
+# run on the python:3.11-slim base image (see ./Dockerfile), so each
+# pin is the oldest release that still ships a cp311 wheel.
+#
+# Do NOT "fix" these. If you need an even older CVE set (e.g. Pillow 5.2.0 or
+# 8.x), that requires changing the base image to an older Python, because those
+# releases have no cp311 wheel and their C extensions fail to build on 3.11.
+Flask==1.1.4
+Flask-SQLAlchemy==2.3.2
+SQLAlchemy==1.4.0
+Flask-CORS==4.0.0
+Flask-JWT-Extended==3.13.1
+psycopg2-binary==2.9.9
+PyJWT==1.7.1
+Werkzeug==1.0.1
+python-dotenv==0.10.0
+requests==2.20.0
+lxml==4.9.3
+Pillow==9.5.0
+python-magic==0.4.27
+PyYAML==6.0.1
+Jinja2==2.11.3
+MarkupSafe==2.0.1
+
+gunicorn==23.0.0
