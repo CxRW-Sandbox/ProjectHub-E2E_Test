@@ -532,3 +532,294 @@ class TestGetProjectsSQLInjectionPrevention:
         after = client.get('/api/v1/projects').get_json()['projects']
         names = [p['name'] for p in after]
         assert 'injected' not in names
+
+
+# ---------------------------------------------------------------------------
+# Helpers for global_search tests
+# ---------------------------------------------------------------------------
+
+def _create_task(db_session, title, description, project_id, created_by):
+    """Create a task directly in the test database."""
+    from models import Task
+    task = Task(
+        title=title,
+        description=description,
+        project_id=project_id,
+        created_by=created_by,
+        status='pending',
+        priority='medium',
+    )
+    db_session.add(task)
+    db_session.commit()
+    return task
+
+
+# ---------------------------------------------------------------------------
+# Functional tests – /api/v1/search endpoint works correctly
+# ---------------------------------------------------------------------------
+
+class TestGlobalSearchFunctionality:
+    """
+    Verify that the /api/v1/search endpoint returns correct results after
+    the parameterized-query fix (CWE-89).
+    """
+
+    def test_search_requires_query_param(self, client, db_session):
+        """Omitting the 'q' parameter returns a 400 error."""
+        response = client.get('/api/v1/search')
+        assert response.status_code == 400
+        data = response.get_json()
+        assert 'error' in data
+
+    def test_search_empty_query_returns_400(self, client, db_session):
+        """An explicitly empty 'q' parameter returns a 400 error."""
+        response = client.get('/api/v1/search?q=')
+        assert response.status_code == 400
+
+    def test_search_response_has_expected_keys(self, client, db_session):
+        """A valid search response always contains query, users, projects, tasks."""
+        response = client.get('/api/v1/search?q=anything')
+        assert response.status_code == 200
+        data = response.get_json()
+        for key in ('query', 'users', 'projects', 'tasks'):
+            assert key in data, f"Expected key '{key}' missing from response"
+
+    def test_search_returns_matching_user_by_username(self, client, db_session):
+        """A search term matching a username returns that user in 'users'."""
+        owner = _create_owner(db_session, username='searchable_user', email='su@example.com')
+
+        response = client.get('/api/v1/search?q=searchable_user')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        usernames = [u.get('username') for u in data['users']]
+        assert 'searchable_user' in usernames
+
+    def test_search_returns_matching_project_by_name(self, client, db_session):
+        """A search term matching a project name returns that project in 'projects'."""
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'SearchableProject', 'some desc', owner.id)
+
+        response = client.get('/api/v1/search?q=SearchableProject')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p.get('name') for p in data['projects']]
+        assert 'SearchableProject' in names
+
+    def test_search_returns_matching_task_by_title(self, client, db_session):
+        """A search term matching a task title returns that task in 'tasks'."""
+        owner = _create_owner(db_session)
+        project = _create_project(db_session, 'TaskProject', 'desc', owner.id)
+        _create_task(db_session, 'SearchableTask', 'some task desc', project.id, owner.id)
+
+        response = client.get('/api/v1/search?q=SearchableTask')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t.get('title') for t in data['tasks']]
+        assert 'SearchableTask' in titles
+
+    def test_search_no_match_returns_empty_lists(self, client, db_session):
+        """A query that matches nothing returns empty lists for all categories."""
+        response = client.get('/api/v1/search?q=zzznomatch_xyz_unique')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['users'] == []
+        assert data['projects'] == []
+        assert data['tasks'] == []
+
+    def test_search_query_echoed_in_response(self, client, db_session):
+        """The 'query' field in the response matches the submitted search term."""
+        term = 'mytestquery'
+        response = client.get(f'/api/v1/search?q={term}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['query'] == term
+
+
+# ---------------------------------------------------------------------------
+# Security tests – SQL injection payloads in /api/v1/search must be treated
+# as literal strings and must NOT alter query structure or results (CWE-89)
+# ---------------------------------------------------------------------------
+
+class TestGlobalSearchSQLInjectionPrevention:
+    """
+    Verify that the global_search endpoint's parameterized queries prevent
+    SQL injection.  Each payload is bound as a LIKE pattern value so it
+    cannot escape the query structure.
+    """
+
+    def test_sqli_or_tautology_does_not_return_all_users(self, client, db_session):
+        """
+        Classic OR-1=1 tautology must NOT return rows that don't match literally.
+
+        Without parameterization the payload would make the WHERE clause always
+        true and expose every user.  With parameterized bindings the entire string
+        is the LIKE operand and only matches a username/email containing that text.
+        """
+        _create_user(db_session, 'sqli_user_gs', 'sqli_gs@example.com')
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        usernames = [u.get('username') for u in data['users']]
+        assert 'sqli_user_gs' not in usernames
+
+    def test_sqli_or_tautology_does_not_return_all_projects(self, client, db_session):
+        """
+        Classic OR-1=1 tautology must NOT return all projects when no real match exists.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'SecretSearchProject', 'confidential', owner.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p.get('name') for p in data['projects']]
+        assert 'SecretSearchProject' not in names
+
+    def test_sqli_or_tautology_does_not_return_all_tasks(self, client, db_session):
+        """
+        Classic OR-1=1 tautology must NOT return all tasks when no real match exists.
+        """
+        owner = _create_owner(db_session)
+        project = _create_project(db_session, 'TautologyTaskProject', 'desc', owner.id)
+        _create_task(db_session, 'SecretSearchTask', 'confidential task', project.id, owner.id)
+
+        payload = "' OR '1'='1"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        titles = [t.get('title') for t in data['tasks']]
+        assert 'SecretSearchTask' not in titles
+
+    def test_sqli_single_quote_does_not_error(self, client, db_session):
+        """A bare single-quote must not raise a DB error."""
+        response = client.get("/api/v1/search?q='")
+        assert response.status_code == 200
+
+    def test_sqli_double_quote_does_not_error(self, client, db_session):
+        """A double-quote must not raise a DB error."""
+        response = client.get('/api/v1/search?q="')
+        assert response.status_code == 200
+
+    def test_sqli_comment_sequences_do_not_alter_results(self, client, db_session):
+        """SQL comment sequences (-- and #) must be treated as literal strings."""
+        _create_user(db_session, 'comment_user_gs', 'comment_gs@example.com')
+
+        for payload in ["--", "#", "' --", "admin'--"]:
+            response = client.get(f'/api/v1/search?q={payload}')
+            assert response.status_code == 200, f"Payload '{payload}' caused an error"
+            data = response.get_json()
+            usernames = [u.get('username') for u in data['users']]
+            assert 'comment_user_gs' not in usernames, (
+                f"Payload '{payload}' unexpectedly returned user 'comment_user_gs'"
+            )
+
+    def test_sqli_semicolon_drop_table_does_not_execute(self, client, db_session):
+        """
+        A stacked DROP TABLE payload must not crash the server or destroy tables.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'SurvivesSearchDrop', 'should survive', owner.id)
+
+        payload = "x'; DROP TABLE projects; --"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        # The projects table must still be queryable
+        get_all = client.get('/api/v1/projects')
+        assert get_all.status_code == 200
+        names = [p['name'] for p in get_all.get_json()['projects']]
+        assert 'SurvivesSearchDrop' in names
+
+    def test_sqli_union_select_users_table(self, client, db_session):
+        """
+        A UNION SELECT payload targeting the users table must not inject extra rows.
+        The parameterized LIKE treats the whole string as a literal value.
+        """
+        payload = "x' UNION SELECT id,username,email,password,role,created_at FROM users --"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        # All result lists should be empty — the literal LIKE pattern won't match anything
+        assert data['users'] == []
+        assert data['projects'] == []
+        assert data['tasks'] == []
+
+    def test_sqli_union_select_does_not_return_extra_project_rows(self, client, db_session):
+        """
+        A UNION SELECT payload targeting projects must not inject rows into results.
+        """
+        payload = "x' UNION SELECT 1,2,3,4,5,6,7 --"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        assert data['projects'] == []
+
+    def test_sqli_numeric_tautology_does_not_return_rows(self, client, db_session):
+        """
+        A numeric tautology (1=1) must not cause all rows to be returned.
+        """
+        owner = _create_owner(db_session)
+        _create_project(db_session, 'NumericTautologySearchProject', 'desc', owner.id)
+
+        payload = "1' OR 1=1 --"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        data = response.get_json()
+        names = [p.get('name') for p in data['projects']]
+        assert 'NumericTautologySearchProject' not in names
+
+    def test_sqli_encoded_quote_does_not_error(self, client, db_session):
+        """URL-encoded single quote (%27) must not cause a server error."""
+        response = client.get('/api/v1/search?q=%27')
+        assert response.status_code == 200
+
+    def test_sqli_null_byte_does_not_error(self, client, db_session):
+        """
+        A null byte (%00) in the query parameter must not cause a server error.
+        Expressed as the URL-encoded form so no raw control byte is embedded in
+        this source file.
+        """
+        response = client.get('/api/v1/search?q=%00')
+        # Must not crash with 500; 400 is acceptable if the app rejects it
+        assert response.status_code in (200, 400)
+
+    def test_sqli_backslash_does_not_error(self, client, db_session):
+        """Backslash sequences in the query must not cause a server error."""
+        response = client.get("/api/v1/search?q=\\")
+        assert response.status_code == 200
+
+    def test_sqli_special_chars_combo_does_not_error(self, client, db_session):
+        """A combination of special SQL characters must not cause a server error."""
+        payload = "'; SELECT * FROM users WHERE ''='"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+    def test_sqli_stacked_insert_does_not_create_row(self, client, db_session):
+        """
+        A stacked INSERT payload must not create a new project row.
+        """
+        # Baseline count
+        before_count = len(client.get('/api/v1/projects').get_json()['projects'])
+
+        payload = "x'; INSERT INTO projects (name, description, owner_id) VALUES ('injected_gs', 'injected', 1); --"
+        response = client.get(f'/api/v1/search?q={payload}')
+        assert response.status_code == 200
+
+        # Ensure the stacked INSERT did not create a new row
+        after = client.get('/api/v1/projects').get_json()['projects']
+        names = [p['name'] for p in after]
+        assert 'injected_gs' not in names
