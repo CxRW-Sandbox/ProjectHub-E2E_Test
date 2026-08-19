@@ -103,7 +103,7 @@
                 <tr>
                     <td>{{ user|user_display_name }}</td>
                     <td>{{ user.email if user.email else 'N/A' }}</td>
-                    <td>{{ user.role|role_badge|safe }}</td>
+                    <td>{{ user.role|role_badge }}</td>
                     <td>{{ user.created_at|format_datetime if user.created_at else 'N/A' }}</td>
                 </tr>
                 {% endfor %}
